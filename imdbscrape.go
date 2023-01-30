@@ -4,43 +4,59 @@ import (
 	"bytes"
 	"encoding/json"
 	"os"
+	"strconv"
+	"time"
 
 	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"net/url"
-	"strconv"
-	"strings"
 
 	"github.com/PuerkitoBio/goquery"
 	"github.com/aws/aws-lambda-go/lambda"
 )
 
+var (
+	local       bool
+	maxNumFilms = 10
+)
+
 type (
 	movie struct {
-		ID       string   `json:"id"`
-		Title    string   `json:"title"`
-		Year     string   `json:"year"`
-		Plot     string   `json:"plot"`
-		Score    int      `json:"metascore"`
-		Director string   `json:"director"`
-		Actors   []string `json:"actors"`
+		ID         string  `json:"id"`
+		ImdbRating float64 `json:"imdbRating"`
 	}
 
 	listings struct {
-		New []movie `json:"new_movies"`
-		Old []movie `json:"old_movies"`
+		Movies   []movie `json:"movies"`
+		ImdbLink string  `json:"imdbLink"`
 	}
 )
 
 func main() {
-	lambda.Start(handleRequest)
+	if os.Getenv("LAMBDA_TASK_ROOT") != "" {
+		lambda.Start(handleRequest)
+	} else {
+		local = true
+		handleRequest()
+	}
 }
 
 func handleRequest() (string, error) {
+	// Update limit if env var provided
+	mxNumFilms, _ := strconv.Atoi(os.Getenv("MAX_NUM_FILMS"))
+	if mxNumFilms > 0 {
+		maxNumFilms = mxNumFilms
+	}
+
+	// Get start and end date strings
+	now := time.Now()
+	end := now.Format("2006-01-02")
+	start := now.AddDate(0, 0, -6).Format("2006-01-02") // 6 days ago
+
 	// Make IMDB request
-	url := "http://www.imdb.com/movies-in-theaters/"
+	url := fmt.Sprintf("https://www.imdb.com/search/title/?title_type=feature&year=%s,%s&view=advanced", start, end)
 	res, err := http.Get(url)
 	if err != nil {
 		log.Fatal(err)
@@ -59,100 +75,27 @@ func handleRequest() (string, error) {
 		return "", nil
 	}
 
-	// Declare vars
-	var (
-		newSel, oldSel       *goquery.Selection
-		newMovies, oldMovies []movie
-	)
-
-	// Find movie lists, then find the overview-tops
-	doc.Find(".list").Each(func(i int, s *goquery.Selection) {
-		if i == 0 {
-			newSel = s.Find(".overview-top")
-		}
-		if i == 1 {
-			oldSel = s.Find(".overview-top")
+	// Scrape
+	var movies []movie
+	doc.Find(".lister-item").Each(func(i int, s *goquery.Selection) {
+		if i < maxNumFilms {
+			id, _ := s.Find(".ribbonize").Attr("data-tconst")
+			rawRating, _ := s.Find(".ratings-imdb-rating").Attr("data-value")
+			rating, _ := strconv.ParseFloat(rawRating, 64)
+			movies = append(movies, movie{id, rating})
 		}
 	})
 
-	// Fill new movies
-	newSel.Each(func(i int, new *goquery.Selection) {
-		title, year := getTitleAndYear(new)
-		m := movie{
-			ID:       getID(new),
-			Title:    title,
-			Year:     year,
-			Plot:     getPlot(new),
-			Director: getDirector(new),
-			Actors:   getActors(new),
-		}
-		newMovies = append(newMovies, m)
-	})
+	// Marshal and send or print
+	data, _ := json.Marshal(listings{movies, url})
+	body := string(data)
+	if local {
+		fmt.Println(body)
+	} else {
+		err = sendSimpleMessage(body)
+	}
 
-	// Fill old movies
-	oldSel.Each(func(i int, old *goquery.Selection) {
-		title, year := getTitleAndYear(old)
-		m := movie{
-			ID:       getID(old),
-			Title:    title,
-			Year:     year,
-			Plot:     getPlot(old),
-			Director: getDirector(old),
-			Actors:   getActors(old),
-		}
-		oldMovies = append(oldMovies, m)
-	})
-
-	// Build json & send
-	data, _ := json.Marshal(listings{newMovies, oldMovies})
-	body := strings.Replace(string(data), "null", "[]", 1) // https://github.com/golang/go/issues/31811
-	err = sendSimpleMessage(body)
 	return "", err
-}
-
-func getID(s *goquery.Selection) (id string) {
-	href, ok := s.Find("a").First().Attr("href")
-	if ok {
-		id = strings.Split(href, "/")[2]
-	}
-	return
-}
-
-func getTitleAndYear(s *goquery.Selection) (title string, year string) {
-	raw := s.Find("a").First().Text()
-	split := strings.Split(raw, " (")
-	title = strings.TrimSpace(split[0])
-	year = strings.TrimRight(split[1], ")")
-	return
-}
-
-func getPlot(s *goquery.Selection) string {
-	plot := s.Find(".outline").Text()
-	plot = strings.Replace(plot, "\n", "", 1)
-	return strings.TrimSpace(plot)
-}
-
-func getScore(s *goquery.Selection) (score int) {
-	el := s.Find(".metascore")
-	if el != nil {
-		score, _ = strconv.Atoi(el.Text())
-	}
-	return
-}
-
-func getDirector(s *goquery.Selection) string {
-	return s.Find(".txt-block").First().Find("a").Text()
-}
-
-func getActors(s *goquery.Selection) []string {
-	var cast []string
-	castTextBlock := s.Find(".txt-block").Last().Find("a")
-
-	castTextBlock.Each(func(i int, sel *goquery.Selection) {
-		cast = append(cast, sel.Text())
-	})
-
-	return cast
 }
 
 func sendSimpleMessage(movieData string) error {
@@ -167,7 +110,7 @@ func sendSimpleMessage(movieData string) error {
 	vals := url.Values{}
 	vals.Add("from", fmt.Sprintf("mailgun me <postmaster@sandbox%s.mailgun.org>", sandboxID))
 	vals.Add("to", fmt.Sprintf("Justin <%s>", emailAddr))
-	vals.Add("subject", "Movies released this week")
+	vals.Add("subject", "Popular movies released this week")
 	vals.Add("text", movieData)
 	body := []byte(vals.Encode())
 
