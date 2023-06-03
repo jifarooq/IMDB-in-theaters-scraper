@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"errors"
@@ -26,6 +27,7 @@ type (
 	movie struct {
 		ID         string  `json:"id"`
 		ImdbRating float64 `json:"imdbRating"`
+		Metascore  float64 `json:"metascore"`
 	}
 
 	listings struct {
@@ -79,10 +81,17 @@ func handleRequest() (string, error) {
 	var movies []movie
 	doc.Find(".lister-item").Each(func(i int, s *goquery.Selection) {
 		if i < maxNumFilms {
+			// ID
 			id, _ := s.Find(".ribbonize").Attr("data-tconst")
+
+			// IMDB rating
 			rawRating, _ := s.Find(".ratings-imdb-rating").Attr("data-value")
 			rating, _ := strconv.ParseFloat(rawRating, 64)
-			movies = append(movies, movie{id, rating})
+
+			// Metascore
+			rawScore := strings.TrimSpace(s.Find(".metascore").First().Text())
+			score, _ := strconv.ParseFloat(rawScore, 64)
+			movies = append(movies, movie{id, rating, score})
 		}
 	})
 
